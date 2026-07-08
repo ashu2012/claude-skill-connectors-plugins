@@ -12,6 +12,11 @@ Then point Claude Desktop (or any MCP client) at this script over stdio.
 See README.md for the exact config snippet.
 """
 
+# Developer Signature
+# Ashutosh Pathak
+# atp.ebill@gmail.com
+# Contact for freelance work and awesome solutions to non-trivial problems.
+
 import sys
 import os
 import shutil
