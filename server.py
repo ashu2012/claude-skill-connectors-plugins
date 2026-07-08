@@ -16,6 +16,10 @@ import sys
 import os
 import shutil
 import fnmatch
+import subprocess
+import time
+import functools
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
 
@@ -68,10 +72,37 @@ def rel(path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Session stats (backs the stats://efficiency resource)
+# ---------------------------------------------------------------------------
+
+_stats = {
+    "session_start": time.time(),
+    "tool_calls": 0,
+    "tool_usage": Counter(),
+    "errors": 0,
+}
+
+
+def tracked(func):
+    """Wrap a tool function so every call/error is counted for the efficiency resource."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        _stats["tool_calls"] += 1
+        _stats["tool_usage"][func.__name__] += 1
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            _stats["errors"] += 1
+            raise
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
+@tracked
 def list_directory(path: str = ".") -> str:
     """
     List files and subdirectories inside the given path (relative to the root folder).
@@ -98,6 +129,7 @@ def list_directory(path: str = ".") -> str:
 
 
 @mcp.tool()
+@tracked
 def read_file(path: str) -> str:
     """
     Read and return the full text content of a file.
@@ -118,6 +150,7 @@ def read_file(path: str) -> str:
 
 
 @mcp.tool()
+@tracked
 def write_file(path: str, content: str, mode: str = "overwrite") -> str:
     """
     Write text content to a file. Creates the file (and parent folders) if needed.
@@ -142,6 +175,7 @@ def write_file(path: str, content: str, mode: str = "overwrite") -> str:
 
 
 @mcp.tool()
+@tracked
 def create_directory(path: str) -> str:
     """
     Create a new directory (including any missing parent directories).
@@ -157,6 +191,7 @@ def create_directory(path: str) -> str:
 
 
 @mcp.tool()
+@tracked
 def delete_file(path: str) -> str:
     """
     Delete a single file.
@@ -174,6 +209,7 @@ def delete_file(path: str) -> str:
 
 
 @mcp.tool()
+@tracked
 def delete_directory(path: str, recursive: bool = False) -> str:
     """
     Delete a directory. Fails if it isn't empty unless recursive=True.
@@ -202,6 +238,7 @@ def delete_directory(path: str, recursive: bool = False) -> str:
 
 
 @mcp.tool()
+@tracked
 def move_file(source: str, destination: str) -> str:
     """
     Move or rename a file or directory.
@@ -220,6 +257,7 @@ def move_file(source: str, destination: str) -> str:
 
 
 @mcp.tool()
+@tracked
 def get_file_info(path: str) -> str:
     """
     Get metadata about a file or directory (size, type, timestamps).
@@ -248,6 +286,7 @@ def get_file_info(path: str) -> str:
 
 
 @mcp.tool()
+@tracked
 def search_files(pattern: str, path: str = ".") -> str:
     """
     Recursively search for files whose name matches a glob pattern (e.g. '*.py', 'report*.txt').
@@ -270,6 +309,85 @@ def search_files(pattern: str, path: str = ".") -> str:
     if not matches:
         return f"No files matching '{pattern}' found under '{path}'."
     return "\n".join(sorted(matches))
+
+
+@mcp.tool()
+@tracked
+def create_venv(path: str, python_executable: str = "") -> str:
+    """
+    Create a new Python virtual environment at the given path inside the root directory.
+
+    Args:
+        path: Relative path (within the root directory) where the venv should be created,
+              e.g. 'my-project/venv'.
+        python_executable: Optional path to a specific Python interpreter to use.
+              Defaults to the interpreter running this server.
+    """
+    target = safe_resolve(path)
+    if target.exists() and any(target.iterdir()):
+        return f"Error: '{path}' already exists and is not empty."
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    interpreter = python_executable or sys.executable
+
+    try:
+        result = subprocess.run(
+            [interpreter, "-m", "venv", str(target)],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+    except FileNotFoundError:
+        return f"Error: python executable '{interpreter}' not found."
+    except subprocess.TimeoutExpired:
+        return "Error: venv creation timed out after 180s."
+
+    if result.returncode != 0:
+        return f"Error creating venv (exit code {result.returncode}):\n{result.stderr.strip()}"
+
+    return (
+        f"Created virtual environment at '{rel(target)}' using '{interpreter}'.\n"
+        f"Activate it with:\n"
+        f"  Windows (PowerShell): {rel(target)}\\Scripts\\Activate.ps1\n"
+        f"  Windows (cmd):        {rel(target)}\\Scripts\\activate.bat\n"
+        f"  Bash / WSL:           source {rel(target)}/bin/activate"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+
+@mcp.resource("stats://efficiency")
+def efficiency_resource() -> str:
+    """
+    Live session efficiency report: how many tool calls have been made,
+    the breakdown per tool, error count, and session duration. Read this
+    resource to see how Claude is using this server during the current run.
+    """
+    elapsed = time.time() - _stats["session_start"]
+    calls = _stats["tool_calls"]
+    errors = _stats["errors"]
+    success_rate = ((calls - errors) / calls * 100) if calls else 100.0
+
+    lines = [
+        "Local Filesystem MCP - Session Efficiency Report",
+        "=================================================",
+        f"Session duration : {elapsed:.1f}s",
+        f"Total tool calls : {calls}",
+        f"Errors           : {errors}",
+        f"Success rate     : {success_rate:.1f}%",
+        f"Calls per minute : {(calls / elapsed * 60) if elapsed > 0 else 0:.2f}",
+        "",
+        "Per-tool usage:",
+    ]
+    if _stats["tool_usage"]:
+        for name, count in _stats["tool_usage"].most_common():
+            lines.append(f"  - {name}: {count}")
+    else:
+        lines.append("  (no tool calls yet this session)")
+
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
